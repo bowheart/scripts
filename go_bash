@@ -1,0 +1,319 @@
+#/bin/bash
+OPTERR=0
+BRANCH=`git rev-parse --abbrev-ref HEAD`
+TARGET=0
+
+function help {
+	echo <<EOF "
+USAGE: go [opt]... [optarg]...
+Automatically synchronize local development branch with a remote dev server.
+
+  -u 		Update the repo's master and dev branches.
+  -o 		Set new origin branch
+  -n [name]	Create new branch and set its upstream target
+  -m 		Supply a custom message for the commit
+  -r		Create a pull request in github for your current local branch
+  -d		Delete your current local branch
+  -l		List local branches
+  -s [branch]	Save me!  I made changes on the wrong branch.  Switch changes to [branch]
+"
+EOF
+}
+
+function getBranch {
+	echo `git rev-parse --abbrev-ref HEAD`
+}
+function escapeBranch {
+	echo `echo $BRANCH | sed -e 's/_/N/g'`
+}
+
+# returns the number of local branches
+function getNumBranches {
+	echo `git rev-parse --abbrev-ref --branches | grep -P '^((?!dev)(?!master).)' | wc -l`
+}
+
+function isLocal {
+	if [ `git rev-parse --abbrev-ref HEAD | grep -P '^((?!dev)(?!master).)'` ]; then echo 1; fi
+}
+
+# If we're on a local branch, return the current branch.  Else, return the first local branch with no pullRequest pending (if none, return the first local branch)
+function getLocal {
+	if [ `isLocal` ]; then
+		echo `git rev-parse --abbrev-ref HEAD`
+	else
+		RET=""
+		for ((i=1; i<=`getNumBranches`; i++)); do
+			CURR_BRANCH=`git rev-parse --abbrev-ref --branches | grep -P '^((?!dev)(?!master).)' | sed "$i q;d"`
+			if [ "`git config --local --bool $(echo $CURR_BRANCH | sed -e 's/_/N/g').hasPullRequest`" = false ]; then
+				RET=$CURR_BRANCH
+				break
+			fi
+		done
+		if [ RET = "" ]; then RET=`git rev-parse --abbrev-ref --branches | grep -P '^((?!dev)(?!master).)' | head -n 1`; fi
+		echo $RET
+	fi
+}
+function localExists {
+	if [ `getLocal` ]; then echo 1; fi
+}
+
+function getCommitNum {
+	if [ `localExists` ]; then echo `git config --local $(getLocal | sed -e 's/_/N/g').commitNum`; fi
+}
+
+# Make sure we're on a local branch.  Exit if there is no local branch.
+function switchToLocal {
+	if [ `localExists` ]; then
+		LOCAL=`getLocal`
+		if [ $BRANCH != $LOCAL ]; then
+			git checkout $LOCAL
+			BRANCH=$LOCAL
+		fi
+	else
+		echo "You don't have a local feature branch.  Create one with 'go -n [name]'"
+		exit 1;
+	fi
+}
+
+function commitChanges {
+	echo "Adding, committing, merging into dev, pushing dev, checking out '$BRANCH' again"
+	git add --all && git commit -m "$MESSAGE" && git push && git checkout dev && git pull && git merge $BRANCH && git push && git checkout $BRANCH
+	git config --local `escapeBranch`.commitNum $((`git config --local $(escapeBranch).commitNum` + 1))
+}
+
+function numModifiedFiles {
+	echo `git status | grep 'modified:' | cut -d' ' -f 4 | wc -l`
+}
+declare -A COPIED_FILES
+function save_copyFiles {
+	for ((i=1; i<=`numModifiedFiles`; i++)); do
+		FILE_NAME=`git status | grep 'modified:' | cut -d' ' -f 4 | sed "$i q;d"`
+		declare -A COPIED_FILES["$FILE_NAME"]=$(<$FILE_NAME)
+	done
+}
+function save_pasteFiles {
+	echo "Pasting Files..."
+	for VAL in ${COPIED_FILES[@]}; do
+		echo "here..."
+		echo $VAL
+	done
+}
+function saveBranch {
+	echo "Swapping modifications into target branch, '$TARGET'"
+	save_copyFiles
+	git checkout -- .
+	git checkout $TARGET
+	save_pasteFiles
+}
+function saveBranchNode {
+			node -e "
+	var fs = require('fs')
+	var numModifiedFiles = `numModifiedFiles`,
+		modifiedFiles = {},
+		targetBranch
+	
+	var prompt = function(question, callback) {
+		var stdin = process.stdin, stdout = process.stdout
+		stdin.resume()
+		stdout.write(question + ' ')
+		
+		stdin.once('data', function(data) {
+			callback(data.toString().trim())
+		})
+	}
+	var copyFiles = function() {
+		for (var i = 0; i < numModifiedFiles; i++) {
+			var nextFile = '`git status | grep 'modified:' | cut -d' ' -f 4 | sed "$i q;d"`'
+			fs.readFile(nextFile, function(err, data) {
+				modifiedFiles[nextFile] = data;
+				if (Object.keys(modifiedFiles).length === numModifiedFiles) switchBranches()
+			});
+		}
+	}
+	var switchBranches = function() {
+		prompt('Enter name of target branch:', function(input) {
+			targetBranch = input
+			var branchExists = '`echo $(git rev-parse --abbrev-ref --branches | grep "^$targetBranch")`'
+			console.log(branchExists, targetBranch, '`echo $targetBranch`')
+			process.exit()
+		})
+	}
+	var pasteFiles = function() {
+		for (var i = 0; i < numModifiedFiles; i++) {
+			var nextFile = '`git status | grep 'modified:' | cut -d' ' -f 4 | sed "$i q;d"`'
+			fs.writeFile('/var/zfiles/temp/test.txt', modifiedFiles[Object.keys(modifiedFiles)[i]], function(err) {
+				if (err) {
+					console.log('Couldn\'t salvage all the files.  Exiting...')
+					return
+				}
+				console.log('Success!  All modified files have been copied to branch \"' + targetBranch + '\"')
+			})
+		}
+	}
+	
+	copyFiles()
+			"
+}
+
+function deleteBranch {
+	echo "Deleting branch, '$BRANCH'"
+	{
+		git checkout master && git pull && git branch -d $BRANCH && git push origin :$BRANCH
+	} || {
+		echo "Kurt must have deleted the upstream branch... Cleaning up Kurt's generosity..."
+		git fetch -p
+	}
+	git config --local --unset `escapeBranch`.commitNum && git config --local --unset `escapeBranch`.hasPullRequest
+	echo "Success! Branch '$BRANCH' successfully deleted"
+}
+
+
+MESSAGE="`getLocal` #`getCommitNum`"
+
+
+while getopts uhn:om:rdls opt; do
+	case $opt in
+		u)
+			echo "Syncing master and dev branches"
+			{
+				git checkout dev && git pull && git checkout master && git pull
+			} || {
+				git checkout master && git pull && git checkout dev && git pull && git checkout master
+			}
+			git fetch -p
+			switchToLocal
+			exit 0
+			;;
+		h)
+			help
+			exit 0
+			;;
+		o)
+			switchToLocal
+			echo "Setting upstream path 'origin/$BRANCH'"
+			{
+				git branch --set-upstream-to origin/$BRANCH
+			} || {
+				echo "ERROR: Could not set upstream target." >&2
+			}
+			exit 0
+			;;
+		n)
+			BRANCH=$OPTARG
+			echo "Creating new branch '$BRANCH' with upstream target 'origin/$BRANCH'"
+			{
+				git checkout master
+				git pull
+				git checkout -b $BRANCH 
+				git push origin $BRANCH 
+				git branch --set-upstream-to origin/$BRANCH 
+				git config --local `escapeBranch`.commitNum 1 && git config --local `escapeBranch`.hasPullRequest 0
+			} || {
+				echo "ERROR: Could not set upstream target." >&2
+				echo "Cleaning up..."
+				git checkout -- *
+				git checkout master
+				git branch -d $BRANCH && git push origin :$BRANCH
+				echo "Exiting"
+			}
+			exit 0
+			;;
+		m)
+			MESSAGE=$OPTARG
+			;;
+		r)
+			echo "Creating pull request for branch '`getLocal`'"
+			switchToLocal
+			{
+				REPO=`git remote show origin | grep 'Fetch URL' | cut -d'/' -f 5 | cut -d'.' -f 1`
+				DATA="{\"title\": \"$BRANCH\", \"head\": \"$BRANCH\", \"base\": \"master\", \"body\": \"Iz Kurtzavvin vun yiht?\"}"
+				curl -so "/var/log/github_pullrequest.log" -X POST -d "$DATA" -H "Authorization: token `git config --global user.token`" https://api.github.com/repos/ipartnr8/$REPO/pulls
+				git config --local `escapeBranch`.hasPullRequest 1
+				echo "Pull request created successfully"
+			} || {
+				echo "ERROR: api request failed." >&2
+				exit 1
+			}
+			
+			exit 0
+			;;
+		l)
+			git rev-parse --abbrev-ref --branches | grep -P '^((?!dev)(?!master).)'
+			exit 0
+			;;
+		s)
+			if [ "`git status | grep 'nothing to commit'`" = "" ]; then
+				saveBranchNode
+			else
+				echo "You don't have any modifications.  Exiting..."
+			fi
+			exit 0
+			
+			
+			TARGET=$OPTARG
+			echo "target: $TARGET"
+			if [ "`git branch | grep ^$TARGET$ | wc -l`" = 0 ]; then
+				read -p "No branch '$TARGET' exists.  Would you like to create it? " -n 1 -r
+				echo
+				if [[ $REPLY =~ ^[Yy]$ ]]; then
+					save_copyFiles
+					# git checkout -- .
+					# go -n $TARGET
+					save_pasteFiles
+				else
+					echo "Exiting..."
+				fi
+				exit 0
+			fi
+			
+			read -p "Moving all `numModifiedFiles` modified files to branch '$TARGET'.  Proceed [y/n]? " -n 1 -r
+			echo
+			if [[ $REPLY =~ ^[Yy]$ ]]; then
+				saveBranch
+			else
+				echo "Exiting..."
+			fi
+			exit 0
+			;;
+		d)
+			switchToLocal
+			
+			if [ "`git status | grep 'nothing to commit'`" = "" ]; then
+				echo "Couldn't delete local branch.  You have uncommitted changes.  Committing them..."
+				commitChanges
+				echo "Recommended: Run 'go -r' to create a pull request for your latest changes."
+				echo "Otherwise, run 'go -d' again to delete"
+				exit 1
+			fi
+			
+			if [ "`git config --local $(escapeBranch).hasPullRequest`" = 0 ]; then
+				echo "Warning: You haven't created any pull requests for this branch."
+			fi
+			
+			read -p "Branch to be deleted: '$BRANCH'.  Proceed [y/n]? " -n 1 -r
+			echo
+			if [[ $REPLY =~ ^[Yy]$ ]]; then
+				deleteBranch
+			else
+				echo "Exiting..."
+			fi
+			
+			exit 0
+			;;
+		\?)
+			echo -e "\nInvalid option $@" >&2
+			help
+			exit 1
+			;;
+	esac
+done
+
+
+switchToLocal
+
+if [ "`git status | grep 'nothing to commit'`" = "" ]; then
+	commitChanges
+else
+	echo "Nothing to commit.  Exiting..."
+	exit 1;
+fi
