@@ -1,5 +1,10 @@
 #!/usr/bin/env node
-require('shelljs/global')
+try {
+	require('shelljs/global')
+} catch(e) {
+	console.log('Error: Unable to find module shelljs.\nRun "export NODE_PATH=\'/usr/local/lib/node_modules\'", then try again.')
+	process.exit()
+}
 
 
 // = = = = = = = = = = = =   Go! -- Git Optimization.  Where the magic happens   = = = = = = = = = = = = //
@@ -22,18 +27,19 @@ Go.prototype = {
 	getOptions: function() {
 		var nextArg
 		while (nextArg = this.args.shift()) {
-			var params = this.getParams()
-			this.options.evaluate(nextArg.slice(1), params)
+			this.options.evaluate(nextArg.slice(1), this.params)
 		}
 	},
 	
-	getParams: function() {
+	get params() {
 		var params = []
-		while (this.args.length && this.args[0].slice(0, 1) !== '-') {
+		while (this.args.length && !(this.args[0].slice(0, 1) === '-' && this.opts.indexOf(this.args[0].slice(1)) > -1 && this.args[0].length === 2)) {
 			params.push(this.args.shift())
 		}
 		return params
 	},
+	
+	opts: ['d', 'D', 'h', 'l', 'm', 'n', 'r', 's', 't', 'u'],
 	
 	options: {
 		evaluate: function(option, params) {
@@ -74,21 +80,23 @@ Go.prototype = {
 		},
 		
 		commit: function(message) {
-			assertChanges()
 			assertOnLocal()
+			assertChanges()
 			message || (message = getCommitMessage())
+			var branch = currentBranch()
 			
 			echo('Adding files to commit')
 			e('git add --all')
 			echo('Committing')
 			e('git commit -m "' + message + '"')
 			echo('Merging into dev branch')
-			e('git checkout dev && git pull && git merge ' + currentBranch())
+			e('git checkout dev && git pull && git merge ' + branch + ' -Xignore-space-change -X theirs')
 			echo('Pushing dev branch')
 			e('git push')
-			echo('Checking out "' + currentBranch() + '" again')
+			echo('Checking out "' + branch + '" again')
+			e('git checkout ' + branch)
 			
-			e('git config --local ' + escapeBranch() + '.commitnum $((`git config --local $(escapeBranch).commitnum` + 1))')
+			e('git config --local go.' + branch + '.commitnum $((`git config --local go.' + branch + '.commitnum` + 1))')
 			echo('Success!  All systems go.')
 		},
 		
@@ -111,15 +119,19 @@ Go.prototype = {
 				} else {
 					e('git checkout master && git pull') // Switch to master
 					try {
+						echo('Deleting the local branch')
 						e_throw('git branch -d ' + branch) // Delete local branch
+						echo('Deleting the remote branch')
 						e_throw('git push origin :' + branch) // Delete upstream branch
-					} catch(e) {
-						echo('Exception thrown: ', e)
+					} catch(exception) {
+						echo('Exception thrown: ', exception)
 						echo('Kurt must have deleted the upstream branch... Cleaning up Kurt\'s generosity...')
 						e('git fetch -p')
 					}
-					e('git config --local --unset ' + branch + '.commitnum && git config --local --unset ' + branch + '.haspullrequest')
+					echo('Cleaning up')
+					e('git config --local --unset go.' + branch + '.commitnum && git config --local --unset go.' + branch + '.haspullrequest')
 					echo('Success!  Branch "' + branch + '" successfully deleted')
+					exit(0)
 				}
 			})
 		},
@@ -144,12 +156,22 @@ Automatically synchronize local development branch with a remote dev server.
 		},
 		
 		new: function(branchName) {
+			if (!branchName) {
+				echo('A name is required for the new branch.  None given.  Exiting...')
+				exit(1)
+			}
 			echo('Checking out master')
 			e('git checkout master')
 			echo('Updating master')
 			e('git pull')
 			echo('Creating new branch "' + branchName + '" and switching to it')
 			e('git checkout -b ' + branchName)
+			
+			if (!onLocal()) {
+				echo('Error: unable to create branch ' + branchName + '.  Name might be invalid.  Exiting...')
+				exit(1)
+			}
+			
 			echo('Setting upstream target to "origin/' + branchName + '"')
 			e('git push origin ' + branchName + ' && git branch --set-upstream-to origin/' + branchName)
 			createGitConfig()
@@ -157,18 +179,28 @@ Automatically synchronize local development branch with a remote dev server.
 		},
 		
 		request: function(requestMessage) {
-			requestMessage || (requestMessage = 'Ohdajoiz\'a bein\'Kurtz')
+			requestMessage || (requestMessage = 'Ohdajoiza beinKurtz')
 			switchToLocal()
 			echo('Creating pull request for branch "' + currentBranch() + '"')
 			try {
+				e('git push')
 				var repo = e("git remote show origin | grep 'Fetch URL' | cut -d'/' -f 5 | cut -d'.' -f 1"),
 					branch = currentBranch(),
-					data = '{"title": "' + branch + '", "head": "' + branch + '", "base": "master", "body": "' + requestMessage + '"}'
-				e('curl -so "/var/log/github_pullrequest.log" -X POST -d "' + data + '" -H "Authorization: token `git config --global user.token`" https://api.github.com/repos/ipartnr8/$REPO/pulls')
-				e('git config --local ' + branch + '.haspullrequest 1')
-				echo('Pull request created successfully')
-			} catch(e) {
-				echo('Error: API request failed.  Message: ', e)
+					data = JSON.stringify({
+						title: branch,
+						head: branch,
+						base: 'master',
+						body: requestMessage
+					})
+				
+				var result = e('curl -X POST -d \'' + data + '\' -H "Authorization: token `git config --global user.token`" https://api.github.com/repos/ipartnr8/' + repo + '/pulls')
+				var requestNum = result.match(/"number": \d+/)[0].split(' ')[1]
+				if (!requestNum) throw result
+				
+				e('git config --local go.' + branch + '.haspullrequest 1')
+				echo('Pull request #' + requestNum + ' created successfully.')
+			} catch(exception) {
+				echo('Error: API request failed.  Message:\n', exception)
 				exit(1)
 			}
 		},
@@ -242,26 +274,19 @@ Automatically synchronize local development branch with a remote dev server.
 		},
 		
 		test: function(params) {
-			echo(branchExists('use_core_frms'))
+			echo(params)
 		},
 		
 		update: function() {
 			echo('Syncing master and dev branches...')
 			
-			var text = '....'
-			var interval = setInterval(function() {
-				echo(text)
-				text += '.'
-			}, 200)
-			
 			try {
 				e_throw('git checkout dev')
 				e('git pull && git checkout master && git pull')
-			} catch(e) {
+			} catch(exception) {
 				e('git checkout master && git pull && git checkout dev && git pull && git checkout master')
 			}
 			e('git fetch -p')
-			clearInterval(interval)
 			echo('Success!  All up-to-date')
 			switchToLocal()
 		}
@@ -283,7 +308,7 @@ function assertChanges() {
 
 function assertGitConfig() {
 	assertOnLocal()
-	if (e('git config --local ' + escapeBranch() + '.commitnum') === '') { // git config doesn't exist.  Create it.
+	if (e('git config --local go.' + currentBranch() + '.commitnum') === '') { // git config doesn't exist.  Create it.
 		createGitConfig()
 	}
 }
@@ -307,7 +332,7 @@ function branchExists(branch) {
 }
 
 function createGitConfig() {
-	e('git config --local ' + escapeBranch() + '.commitNum 1 && git config --local ' + escapeBranch() + '.haspullrequest 0')
+	e('git config --local go.' + currentBranch() + '.commitnum 1 && git config --local go.' + currentBranch() + '.haspullrequest 0')
 }
 
 function currentBranch() {
@@ -321,22 +346,17 @@ function e(command) {
 
 function e_throw(command) {
 	var result = e(command)
-	if (result.indexOf('error:') > -1) throw(result)
+	if (result.indexOf('error:') > -1) throw result
 	return result
-}
-
-function escapeBranch(branch) {
-	branch || (branch = currentBranch())
-	return branch.replace(/_/g, 'n') // n -- any arbitrary char; git config keys can't have underscores.
 }
 
 function getCommitMessage() {
 	assertGitConfig()
-	return currentBranch() + ' #' + e('git config --local ' + escapeBranch() + '.commitnum')
+	return currentBranch() + ' #' + e('git config --local go.' + currentBranch() + '.commitnum')
 }
 
 function getFirstLocalBranch() {
-	return onLocal() ? currentBranch() : getLocalBranches().split(/\n/g)[0]
+	return onLocal() ? currentBranch() : getLocalBranches()[0]
 }
 
 function getLocalBranches() {
